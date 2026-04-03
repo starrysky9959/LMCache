@@ -5,6 +5,7 @@ import math
 import re
 import resource
 import subprocess
+from typing import Any
 
 # Third Party
 from huggingface_hub import HfApi
@@ -19,18 +20,94 @@ def determine_per_gpu_memory():
     return total_memory
 
 
+def _extract_parameter_count_from_model_name(model_name: str) -> int | None:
+    matches = re.findall(r"(\d+(?:\.\d+)?)\s*([bBmMkK])", model_name)
+    if not matches:
+        return None
+    magnitude, suffix = matches[-1]
+    scale = {"k": 10**3, "m": 10**6, "b": 10**9}[suffix.lower()]
+    return int(float(magnitude) * scale)
+
+
+def _get_total_parameter_count(info: Any, model_name: str) -> int:
+    safetensors = getattr(info, "safetensors", None)
+    if safetensors is not None:
+        parameters = getattr(safetensors, "parameters", None)
+        if parameters:
+            return sum(parameters.values())
+        total = getattr(safetensors, "total", None)
+        if total:
+            return int(total)
+
+    for attr_name in ("cardData", "config", "transformersInfo"):
+        metadata = getattr(info, attr_name, None)
+        if not isinstance(metadata, dict):
+            continue
+        for key in (
+            "num_parameters",
+            "parameter_count",
+            "model_size",
+            "num_params",
+            "parameters",
+        ):
+            value = metadata.get(key)
+            if isinstance(value, int) and value > 0:
+                return value
+            if isinstance(value, float) and value > 0:
+                return int(value)
+            if isinstance(value, str):
+                parsed = _extract_parameter_count_from_model_name(value)
+                if parsed is not None:
+                    return parsed
+
+    parsed = _extract_parameter_count_from_model_name(model_name)
+    if parsed is not None:
+        return parsed
+
+    raise RuntimeError(
+        "Unable to determine the model parameter count from Hugging Face metadata "
+        f"or the model name: {model_name}"
+    )
+
+
+def _get_weight_bits(info: Any) -> int:
+    safetensors = getattr(info, "safetensors", None)
+    if safetensors is not None:
+        parameters = getattr(safetensors, "parameters", None)
+        if parameters:
+            for dtype in parameters:
+                m = re.search(r"\d+", dtype)
+                if m is not None:
+                    return int(m.group())
+
+    for attr_name in ("config", "cardData", "transformersInfo"):
+        metadata = getattr(info, attr_name, None)
+        if not isinstance(metadata, dict):
+            continue
+        for key in ("torch_dtype", "dtype"):
+            dtype = metadata.get(key)
+            if not isinstance(dtype, str):
+                continue
+            normalized = dtype.lower()
+            if "4" in normalized and ("int" in normalized or "fp4" in normalized):
+                return 4
+            if "8" in normalized and ("int" in normalized or "fp8" in normalized):
+                return 8
+            if any(token in normalized for token in ("bfloat16", "float16", "fp16")):
+                return 16
+            if "float32" in normalized or normalized == "fp32":
+                return 32
+
+    # Most public foundation checkpoints default to bf16/fp16 weights.
+    return 16
+
+
 def get_tensor_parallel_recommendation(model_name: str):
     api = HfApi()
     info = api.model_info(model_name)
-    total_bits = 0
-    for dtype, num_weights in info.safetensors.parameters.items():
-        m = re.search(r"\d+", dtype)
-        assert m is not None, "No bits information found from the HF API"
-        num_bits_in_dtype = int(m.group())
-        total_bits = num_bits_in_dtype * num_weights
-        break
-    if total_bits == 0:
-        raise RuntimeError("No parameters found in the model")
+    num_parameters = _get_total_parameter_count(info, model_name)
+    num_bits_in_dtype = _get_weight_bits(info)
+    total_bits = num_parameters * num_bits_in_dtype
 
     total_model_weights_gb = total_bits / 8 / (1024**3)
     print(f"Model weights total gb: {total_model_weights_gb}")

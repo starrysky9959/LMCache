@@ -67,9 +67,11 @@ from dataclasses import dataclass
 import argparse
 import asyncio
 import os
+import re
 import random
 import sys
 import time
+import urllib.request
 
 # Third Party
 from openai import AsyncOpenAI
@@ -87,7 +89,9 @@ class RequestStats:
     prompt_id: int
     request_start: float
     ttft: float
+    tpot: float
     request_end: float
+    output_tokens: int
     successful: bool
 
 
@@ -200,6 +204,22 @@ def extract_content(chunk, completions_mode=False):
         return ""
 
 
+def extract_completion_tokens(chunk):
+    """
+    Extract completion token count from a streaming chunk usage payload.
+    Returns None if usage is unavailable on this chunk.
+    """
+    usage = getattr(chunk, "usage", None)
+    if usage is None:
+        return None
+
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    if completion_tokens is None:
+        return None
+
+    return int(completion_tokens)
+
+
 def write_resp(text: str):
     """
     Write text to the specified output file (if any), otherwise to stdout.
@@ -234,6 +254,7 @@ async def process_single_prompt(
         # a request starts once it acquires the semaphore
         start_time = time.time()
         first_token_time = None
+        completion_tokens = None
 
         # add stop None so we always get the number of output tokens we specify
         if completions_mode:
@@ -264,6 +285,10 @@ async def process_single_prompt(
         responses = []
         # Collect the response chunks
         async for chunk in response:
+            chunk_completion_tokens = extract_completion_tokens(chunk)
+            if chunk_completion_tokens is not None:
+                completion_tokens = chunk_completion_tokens
+
             if not chunk.choices:
                 continue
 
@@ -280,11 +305,24 @@ async def process_single_prompt(
 
         # TTFT < 0 means not successful
         ttft = (first_token_time - start_time) if first_token_time is not None else -1
+        if completion_tokens is None:
+            completion_tokens = output_len if first_token_time is not None else 0
+
+        if first_token_time is None or completion_tokens <= 0:
+            tpot = -1
+        else:
+            decode_time = end_time - first_token_time
+            tpot = decode_time if completion_tokens == 1 else decode_time / (
+                completion_tokens - 1
+            )
+
         return RequestStats(
             prompt_id=prompt_index,
             request_start=start_time,
             ttft=ttft,
+            tpot=tpot,
             request_end=end_time,
+            output_tokens=completion_tokens,
             successful=ttft > 0,
         )
 
@@ -478,6 +516,167 @@ def trimmed_mean(series: pd.Series, trim_fraction: float) -> float:
     return float(s.iloc[k : n - k].mean())
 
 
+def series_stats(series: pd.Series) -> dict[str, float | None]:
+    """
+    Return basic descriptive stats for a numeric series.
+    """
+    s = series.dropna()
+    if len(s) == 0:
+        return {
+            "mean": None,
+            "min": None,
+            "max": None,
+            "p50": None,
+            "p90": None,
+            "p95": None,
+            "p99": None,
+        }
+
+    return {
+        "mean": float(s.mean()),
+        "min": float(s.min()),
+        "max": float(s.max()),
+        "p50": float(s.quantile(0.50)),
+        "p90": float(s.quantile(0.90)),
+        "p95": float(s.quantile(0.95)),
+        "p99": float(s.quantile(0.99)),
+    }
+
+
+def sanitize_json_value(value):
+    """
+    Replace pandas/NaN values with JSON-safe primitives.
+    """
+    if isinstance(value, dict):
+        return {k: sanitize_json_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [sanitize_json_value(v) for v in value]
+    if pd.isna(value):
+        return None
+    return value
+
+
+PROMETHEUS_METRIC_LINE = re.compile(
+    r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+(?P<value>[-+0-9.eE]+)\s*$"
+)
+
+
+def metrics_url_from_base_url(base_url: str) -> str:
+    if base_url.endswith("/v1"):
+        return f"{base_url[:-3]}/metrics"
+    return f"{base_url.rstrip('/')}/metrics"
+
+
+def scrape_prometheus_metrics(metrics_url: str) -> dict[str, float]:
+    with urllib.request.urlopen(metrics_url, timeout=10) as response:
+        payload = response.read().decode("utf-8", errors="replace")
+
+    totals: dict[str, float] = {}
+    for line in payload.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = PROMETHEUS_METRIC_LINE.match(line)
+        if match is None:
+            continue
+        name = match.group("name")
+        value = float(match.group("value"))
+        totals[name] = totals.get(name, 0.0) + value
+    return totals
+
+
+def prefix_cache_metrics_delta(
+    before: dict[str, float] | None,
+    after: dict[str, float] | None,
+) -> dict[str, float | None]:
+    if before is None or after is None:
+        return {
+            "prefix_queries": None,
+            "prefix_hits": None,
+            "prefix_hit_rate": None,
+            "external_prefix_queries": None,
+            "external_prefix_hits": None,
+            "external_prefix_hit_rate": None,
+        }
+
+    prefix_queries = after.get("vllm:prefix_cache_queries", 0.0) - before.get(
+        "vllm:prefix_cache_queries", 0.0
+    )
+    prefix_hits = after.get("vllm:prefix_cache_hits", 0.0) - before.get(
+        "vllm:prefix_cache_hits", 0.0
+    )
+    external_prefix_queries = after.get(
+        "vllm:external_prefix_cache_queries", 0.0
+    ) - before.get("vllm:external_prefix_cache_queries", 0.0)
+    external_prefix_hits = after.get("vllm:external_prefix_cache_hits", 0.0) - before.get(
+        "vllm:external_prefix_cache_hits", 0.0
+    )
+
+    return {
+        "prefix_queries": prefix_queries,
+        "prefix_hits": prefix_hits,
+        "prefix_hit_rate": (prefix_hits / prefix_queries) if prefix_queries > 0 else None,
+        "external_prefix_queries": external_prefix_queries,
+        "external_prefix_hits": external_prefix_hits,
+        "external_prefix_hit_rate": (
+            external_prefix_hits / external_prefix_queries
+            if external_prefix_queries > 0
+            else None
+        ),
+    }
+
+
+def summarize_round(
+    df: pd.DataFrame,
+    round_name: str,
+    duration_seconds: float,
+    trim_fraction: float,
+    prefix_cache_metrics: dict[str, float | None] | None = None,
+) -> dict[str, object]:
+    """
+    Build a JSON-serializable summary for one benchmark round.
+    """
+    prompt_count = int(len(df))
+    success_df = df.query("successful == True")
+    tpot_df = df.query("successful == True and tpot >= 0")
+    success_count = int(len(success_df))
+    failed_count = prompt_count - success_count
+
+    latency_series = df["request_end"] - df["request_start"]
+    ttft_series = success_df["ttft"]
+    tpot_series = tpot_df["tpot"]
+    output_tokens_series = df["output_tokens"]
+
+    summary = {
+        "round_name": round_name,
+        "prompt_count": prompt_count,
+        "successful_prompt_count": success_count,
+        "failed_prompt_count": failed_count,
+        "success_rate": (float(success_count) / prompt_count) if prompt_count else None,
+        "duration_seconds": float(duration_seconds),
+        "duration_per_prompt": (float(duration_seconds) / prompt_count) if prompt_count else None,
+        "ttft_trimmed_mean": trimmed_mean(ttft_series, trim_fraction),
+        "tpot_trimmed_mean": trimmed_mean(tpot_series, trim_fraction),
+        "request_latency": series_stats(latency_series),
+        "ttft": series_stats(ttft_series),
+        "tpot": series_stats(tpot_series),
+        "output_tokens": {
+            "total": int(output_tokens_series.sum()) if prompt_count else 0,
+            **series_stats(output_tokens_series),
+        },
+    }
+
+    if "is_miss" in df.columns:
+        miss_count = int(df["is_miss"].sum())
+        summary["miss_prompt_count"] = miss_count
+        summary["hit_prompt_count"] = prompt_count - miss_count
+
+    if prefix_cache_metrics is not None:
+        summary["prefix_cache"] = sanitize_json_value(prefix_cache_metrics)
+
+    return sanitize_json_value(summary)
+
+
 async def main(args):
     random.seed(args.shuffle_seed)
 
@@ -485,6 +684,7 @@ async def main(args):
     # No timeout: some benchmarks can take 4-5 minutes per request
     base_url = get_url_from_args(args)
     print("Using base URL:", base_url)
+    metrics_url = metrics_url_from_base_url(base_url)
 
     api_key = os.getenv("OPENAI_API_KEY", "sk-dummy")
 
@@ -509,6 +709,7 @@ async def main(args):
         output_len=args.output_len,
         max_inflight_requests=args.max_inflight_requests,
     )
+    metrics_after_prewarmup = scrape_prometheus_metrics(metrics_url)
 
     # Prepare the prompts:
     # we append the document id at the beginning to avoid any of the document
@@ -522,6 +723,7 @@ async def main(args):
     prompts, miss_mask = add_cache_misses(prompts, args.hit_miss_ratio)
 
     write_resp("------warm up round------\n")
+    warmup_metrics_before = scrape_prometheus_metrics(metrics_url)
     warmup_start_time = time.time()
     warmup_request_stats = await test_long_document_qa(
         client=client,
@@ -531,6 +733,7 @@ async def main(args):
         max_inflight_requests=args.max_inflight_requests,
     )
     warmup_end_time = time.time()
+    warmup_metrics_after = scrape_prometheus_metrics(metrics_url)
     write_resp("------query round------\n")
 
     sleep_time_after_warmup = args.sleep_time_after_warmup
@@ -538,6 +741,7 @@ async def main(args):
         write_resp(f"Sleeping for {sleep_time_after_warmup} seconds after warmup...\n")
         time.sleep(sleep_time_after_warmup)
 
+    query_metrics_before = scrape_prometheus_metrics(metrics_url)
     benchmark_start_time = time.time()
     benchmark_request_stats = await test_long_document_qa(
         client=client,
@@ -547,6 +751,7 @@ async def main(args):
         max_inflight_requests=args.max_inflight_requests,
     )
     benchmark_end_time = time.time()
+    query_metrics_after = scrape_prometheus_metrics(metrics_url)
 
     warmup_df = pd.DataFrame([stats.__dict__ for stats in warmup_request_stats])
     relative_time(warmup_df, warmup_start_time)
@@ -559,26 +764,48 @@ async def main(args):
     benchmark_df.to_csv("query_round.csv", index=False)
 
     # Print results
-    warmup_mean_ttft = trimmed_mean(
-        warmup_df.query("successful == True")["ttft"], args.trim_fraction
+    warmup_duration = warmup_end_time - warmup_start_time
+    query_duration = benchmark_end_time - benchmark_start_time
+    prewarmup_prefix_metrics = prefix_cache_metrics_delta(
+        None, metrics_after_prewarmup
     )
-    query_mean_ttft = trimmed_mean(
-        benchmark_df.query("successful == True")["ttft"], args.trim_fraction
+    warmup_prefix_metrics = prefix_cache_metrics_delta(
+        warmup_metrics_before, warmup_metrics_after
     )
-    warmup_success_count = warmup_df.query("successful == True").shape[0]
-    query_success_count = benchmark_df.query("successful == True").shape[0]
+    query_prefix_metrics = prefix_cache_metrics_delta(
+        query_metrics_before, query_metrics_after
+    )
+    warmup_summary = summarize_round(
+        warmup_df,
+        "warmup",
+        warmup_duration,
+        args.trim_fraction,
+        prefix_cache_metrics=warmup_prefix_metrics,
+    )
+    query_summary = summarize_round(
+        benchmark_df,
+        "query",
+        query_duration,
+        args.trim_fraction,
+        prefix_cache_metrics=query_prefix_metrics,
+    )
+    warmup_mean_ttft = warmup_summary["ttft_trimmed_mean"]
+    query_mean_ttft = query_summary["ttft_trimmed_mean"]
+    warmup_mean_tpot = warmup_summary["tpot_trimmed_mean"]
+    query_mean_tpot = query_summary["tpot_trimmed_mean"]
+    warmup_success_count = warmup_summary["successful_prompt_count"]
+    query_success_count = query_summary["successful_prompt_count"]
     CSI = "\x1b["
     RESET = CSI + "0m"
     print(f"Warmup round mean TTFT: {warmup_mean_ttft:.3f}s")
-    print(f"Warmup round time: {warmup_end_time - warmup_start_time:.3f}s")
+    print(f"Warmup round mean TPOT: {warmup_mean_tpot:.3f}s/token")
+    print(f"Warmup round time: {warmup_duration:.3f}s")
     print(f"Warmup round prompt count: {len(warmup_df)}")
     print(f"Warmup round successful prompt count: {warmup_success_count}")
     print(f"{CSI}36;1m\n=== BENCHMARK RESULTS ==={RESET}")
     print(f"{CSI}32mQuery round mean TTFT: {query_mean_ttft:.3f}s{RESET}")
-    print(
-        f"{CSI}33mQuery round time: "
-        f"{benchmark_end_time - benchmark_start_time:.3f}s{RESET}"
-    )
+    print(f"{CSI}32mQuery round mean TPOT: {query_mean_tpot:.3f}s/token{RESET}")
+    print(f"{CSI}33mQuery round time: {query_duration:.3f}s{RESET}")
     print(f"{CSI}35mQuery round prompt count: {len(benchmark_df)}{RESET}")
     print(f"{CSI}34mQuery round successful prompt count: {query_success_count}{RESET}")
 
@@ -586,19 +813,32 @@ async def main(args):
         visualize_results(warmup_df, benchmark_df)
 
     if args.json_output:
-        query_duration = benchmark_end_time - benchmark_start_time
-        query_round_time_per_prompt = query_duration / len(benchmark_df)
-        warmup_duration = warmup_end_time - warmup_start_time
-        warmup_round_time_per_prompt = warmup_duration / len(warmup_df)
         # Standard
         import json
 
         summary = {
             "query_ttft_per_prompt": query_mean_ttft,
-            "query_round_time_per_prompt": query_round_time_per_prompt,
-            "warmup_round_time_per_prompt": warmup_round_time_per_prompt,
+            "query_tpot_per_token": query_mean_tpot,
+            "query_round_time_per_prompt": query_summary["duration_per_prompt"],
+            "warmup_ttft_per_prompt": warmup_mean_ttft,
+            "warmup_tpot_per_token": warmup_mean_tpot,
+            "warmup_round_time_per_prompt": warmup_summary["duration_per_prompt"],
+            "warmup_round_time_seconds": warmup_duration,
+            "query_round_time_seconds": query_duration,
+            "warmup_prompt_count": warmup_summary["prompt_count"],
+            "query_prompt_count": query_summary["prompt_count"],
+            "warmup_successful_prompt_count": warmup_success_count,
+            "query_successful_prompt_count": query_success_count,
+            "warmup_failed_prompt_count": warmup_summary["failed_prompt_count"],
+            "query_failed_prompt_count": query_summary["failed_prompt_count"],
+            "warmup_success_rate": warmup_summary["success_rate"],
+            "query_success_rate": query_summary["success_rate"],
+            "trim_fraction": args.trim_fraction,
+            "prewarmup_prefix_cache": prewarmup_prefix_metrics,
+            "warmup": warmup_summary,
+            "query": query_summary,
         }
-        print(json.dumps(summary))
+        print(json.dumps(sanitize_json_value(summary)))
 
 
 def create_argument_parser():
